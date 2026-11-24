@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   release-please:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.repository == 'career-ops-hq/career-ops' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
       # release-please opens and updates its release PR with a GitHub App token,
@@ -51,7 +51,7 @@ jobs:
     # publishes nothing), or on a manual dispatch. It stays in this file: the
     # trusted publisher on npmjs.com is bound to the workflow filename
     # (release.yml). For a release, the checkout is the tagged commit.
-    if: ${{ (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'career-ops-v')) || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.repository == 'career-ops-hq/career-ops' && ((github.event_name == 'release' && startsWith(github.event.release.tag_name, 'career-ops-v')) || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -102,7 +102,7 @@ jobs:
     # career-ops release. Reads the version from the manifest of the tagged
     # commit rather than an event field, so it cannot drift from what was
     # actually released.
-    if: ${{ github.event_name == 'release' && startsWith(github.event.release.tag_name, 'web-v') }}
+    if: ${{ github.repository == 'career-ops-hq/career-ops' && github.event_name == 'release' && startsWith(github.event.release.tag_name, 'web-v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
