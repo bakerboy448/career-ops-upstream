@@ -11,7 +11,7 @@
 // "Posted 5 Days Ago", "Posted 30+ Days Ago"); postedAt is derived from it
 // and omitted for the unbounded "30+ Days Ago" form.
 
-import { BROWSER_LIKE_USER_AGENT, fetchJsonWithRetry, sleep } from './_http.mjs';
+import { BROWSER_LIKE_USER_AGENT, createKeyedLimiter, fetchJsonWithRetry, isCloudflareChallenge, sleep } from './_http.mjs';
 
 // Why one paginated pass (the unfaceted root crawl, or one facet-split slice)
 // stopped. COMPLETE covers both "ran out of pages" and "hit the offset
@@ -55,7 +55,118 @@ const MAX_PAGES_CAP = 1500;
 // silently truncates an entire tenant (e.g. a 3,383-posting tenant reduced to
 // 20 jobs on page 2). Non-transient errors (4xx other than 429) are not
 // retried — retrying a malformed request just wastes the budget.
-const RETRY_POLICY = { retries: 3 };
+//
+// A 429 gets its own, slower ladder (`rateLimit`): the WAF answers in bursts
+// that outlast the 5xx ladder's ~3.5 s, so a tenant was cut short after four
+// quick 429s. Six retries from 2 s doubling to a 30 s cap, Retry-After honoured
+// up to 60 s. A Cloudflare challenge is still never retried (isRetryableError).
+const RETRY_POLICY = { retries: 3, rateLimit: { retries: 6, baseDelayMs: 2_000, maxDelayMs: 30_000 } };
+
+function envLimit(name, fallback) {
+  const n = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// Concurrency across the whole process, not just within one tenant's loop.
+// scan.mjs runs up to 10 boards at once; without this, several entries for the
+// same tenant hit it in parallel. One request per tenant at a time, four Workday
+// requests overall. A request holds its slot through its own retry backoff, so
+// a tenant answering 429 is left alone until it recovers. Tune with
+// CAREER_OPS_WORKDAY_TENANT_CONCURRENCY and CAREER_OPS_WORKDAY_CONCURRENCY.
+export const WORKDAY_TENANT_CONCURRENCY = envLimit('CAREER_OPS_WORKDAY_TENANT_CONCURRENCY', 1);
+export const WORKDAY_CONCURRENCY = envLimit('CAREER_OPS_WORKDAY_CONCURRENCY', 4);
+const workdayLimiter = createKeyedLimiter({ perKey: WORKDAY_TENANT_CONCURRENCY, total: WORKDAY_CONCURRENCY });
+
+/** The tenant a CXS URL belongs to (its host), the key concurrency is limited on. */
+export function workdayTenantKey(url) {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return String(url);
+  }
+}
+
+// Total backoff time one tenant may spend per run (default 10 min). Once spent,
+// the tenant is skipped for the rest of the run, so a WAF that keeps answering
+// 429 cannot stretch a scan past a scheduler's time limit.
+// CAREER_OPS_WORKDAY_RETRY_BUDGET_MS overrides it.
+export const WORKDAY_TENANT_RETRY_BUDGET_MS = envLimit('CAREER_OPS_WORKDAY_RETRY_BUDGET_MS', 600_000);
+const tenantRetryState = new Map();
+
+// Circuit breaker. Once requests to WORKDAY_BREAKER_HOSTS distinct tenant hosts
+// have each ended on HTTP 429 (after the full 429 ladder or the tenant's retry
+// budget) with no success in between, every later Workday request in this run
+// fails at once. Several unrelated tenants refusing in a row means the limit is
+// on this client, not on one tenant, and more requests only extend it. A
+// Cloudflare challenge does not count: it is not a rate signal, and it is
+// already reported without a retry. CAREER_OPS_WORKDAY_BREAKER_HOSTS overrides it.
+export const WORKDAY_BREAKER_HOSTS = envLimit('CAREER_OPS_WORKDAY_BREAKER_HOSTS', 3);
+const breaker = { hosts: new Set(), open: false };
+const loggedRateLimitHosts = new Set();
+
+/** True once the breaker has stopped Workday requests for this run. */
+export function workdayBreakerOpen() {
+  return breaker.open;
+}
+
+/** Clear per-tenant retry budgets and breaker state. Exported for the test suite. */
+export function resetWorkdayRetryBudgets() {
+  tenantRetryState.clear();
+  breaker.hosts.clear();
+  breaker.open = false;
+  loggedRateLimitHosts.clear();
+}
+
+function noteRateLimited(key, err) {
+  if (!loggedRateLimitHosts.has(key)) {
+    loggedRateLimitHosts.add(key);
+    console.error(`⚠️  workday: ${key} answered HTTP 429 after ${err?.attempts ?? '?'} attempt(s), Retry-After ${err?.retryAfter ?? 'absent'}`);
+  }
+  breaker.hosts.add(key);
+  if (!breaker.open && breaker.hosts.size >= WORKDAY_BREAKER_HOSTS) {
+    breaker.open = true;
+    console.error(`⚠️  workday: circuit breaker open: HTTP 429 from ${breaker.hosts.size} different tenant hosts in a row (${[...breaker.hosts].join(', ')}); no further Workday requests this run`);
+  }
+}
+
+function breakerError() {
+  const err = new Error('workday circuit breaker open: repeated HTTP 429 across tenant hosts');
+  err.status = 429;
+  err.attempts = 0;
+  err.workdayBreakerOpen = true;
+  return err;
+}
+
+function wdFetchJson(ctx, url, opts, policy = RETRY_POLICY) {
+  const key = workdayTenantKey(url);
+  let state = tenantRetryState.get(key);
+  if (!state) {
+    state = { spentMs: 0, maxMs: WORKDAY_TENANT_RETRY_BUDGET_MS, skipped: false };
+    tenantRetryState.set(key, state);
+  }
+  return workdayLimiter.run(key, async () => {
+    if (breaker.open) throw breakerError();
+    if (state.skipped) {
+      const err = new Error(`tenant skipped for this run: retry budget of ${state.maxMs} ms spent`);
+      err.status = 429;
+      err.attempts = 0;
+      err.retryBudgetExhausted = true;
+      throw err;
+    }
+    try {
+      const out = await fetchJsonWithRetry(ctx, url, opts, { ...policy, retryBudget: state });
+      breaker.hosts.clear();
+      return out;
+    } catch (err) {
+      if (err?.status === 429 && !err.workdayBreakerOpen && !isCloudflareChallenge(err)) noteRateLimited(key, err);
+      if (err?.retryBudgetExhausted && !state.skipped) {
+        state.skipped = true;
+        console.error(`⚠️  workday: ${key} skipped for the rest of this run: ${Math.round(state.spentMs / 1000)}s spent retrying HTTP 429/5xx (budget ${Math.round(state.maxMs / 1000)}s)`);
+      }
+      throw err;
+    }
+  });
+}
 
 // Delay between successive pages *within one tenant's own pagination loop*
 // (not between tenants — that's scan-ats-full.mjs's concurrency, a separate
@@ -927,7 +1038,7 @@ export default {
      */
     const runQuery = async (appliedFacets) => {
       pagesSpent++;
-      const first = await fetchJsonWithRetry(ctx, ep.api, { ...postOpts, body: makeBody(0, appliedFacets) }, RETRY_POLICY);
+      const first = await wdFetchJson(ctx, ep.api, { ...postOpts, body: makeBody(0, appliedFacets) }, RETRY_POLICY);
       const jobs = parseWorkdayResponse(first, entry);
 
       const total = typeof first?.total === 'number' ? first.total : null;
@@ -985,7 +1096,7 @@ export default {
           pagesSpent++;
           let json;
           try {
-            json = await fetchJsonWithRetry(ctx, ep.api, { ...postOpts, body: makeBody(page * PAGE_SIZE, appliedFacets) }, RETRY_POLICY);
+            json = await wdFetchJson(ctx, ep.api, { ...postOpts, body: makeBody(page * PAGE_SIZE, appliedFacets) }, RETRY_POLICY);
           } catch (err) {
             const jobsSummary = `${jobs.length}${total !== null ? ` of ${total}` : ''} jobs`;
             // err.attempts (set by fetchJsonWithRetry) is the actual request count —
@@ -1236,13 +1347,13 @@ export default {
         // otherwise), so this posting spends at most what is left and the
         // documented ceiling holds for every tenant, not just healthy ones.
         const remaining = MAX_DETAIL_REQUESTS - requests;
-        const policy = { ...RETRY_POLICY, retries: Math.min(RETRY_POLICY.retries, remaining - 1) };
+        const policy = { ...RETRY_POLICY, retries: Math.min(RETRY_POLICY.retries, remaining - 1), maxAttempts: remaining };
         // Fetched once and parsed twice: the location and the date both live in
         // this one document, and a second GET for the date would double the
         // cost of the enrichment for a field that is already in hand.
         let detail;
         try {
-          detail = await fetchJsonWithRetry(meteredCtx, `${ep.cxsBase}${externalPath}`, detailOpts, policy);
+          detail = await wdFetchJson(meteredCtx, `${ep.cxsBase}${externalPath}`, detailOpts, policy);
         } catch {
           // Fail soft, per posting. A detail document that 404s, rate-limits or
           // returns something unexpected leaves the placeholder exactly as it

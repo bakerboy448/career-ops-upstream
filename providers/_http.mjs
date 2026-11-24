@@ -818,28 +818,47 @@ export function isRetryableError(err) {
  * Splitting them into two copies is how the entity decoders drifted (#1555,
  * #1639).
  *
+ * A policy may carry a separate `rateLimit` budget for HTTP 429. A WAF that
+ * rate-limits in bursts needs a longer, slower ladder than a 5xx blip does:
+ * with `rateLimit` set, a 429 spends its own `retries` with its own backoff,
+ * and its Retry-After is clamped to `rateLimit.maxDelayMs * 2` instead of the
+ * base `maxDelayMs * 4`. `maxAttempts`, when set, caps all attempts together.
+ * `retryBudget`, a { spentMs, maxMs } object the caller shares across requests,
+ * stops the retries once the next backoff would spend past maxMs; the error then
+ * carries `retryBudgetExhausted: true`.
+ *
  * @param {() => Promise<any>} request - Performs one attempt.
  * @param {{ sleep?: (ms: number) => Promise<void> }} ctx - Transport context (may supply a test clock).
- * @param {{ retries?: number, baseDelayMs?: number, maxDelayMs?: number }} [policy]
+ * @param {{ retries?: number, baseDelayMs?: number, maxDelayMs?: number, maxAttempts?: number,
+ *   rateLimit?: { retries?: number, baseDelayMs?: number, maxDelayMs?: number },
+ *   retryBudget?: { spentMs: number, maxMs: number } }} [policy]
  * @returns {Promise<any>} Whatever `request` resolves to on its first success.
  */
 async function withRetry(request, ctx, policy = {}) {
-  const { retries, baseDelayMs, maxDelayMs } = { ...RETRY_DEFAULTS, ...policy };
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  const base = { ...RETRY_DEFAULTS, ...policy };
+  const limited = policy.rateLimit ? { ...base, ...policy.rateLimit } : null;
+  const maxAttempts = Number.isFinite(policy.maxAttempts) ? Math.max(1, policy.maxAttempts) : Infinity;
+  let attempt = 0;
+  let transientRetries = 0;
+  let rateLimitRetries = 0;
+  for (;;) {
     try {
       return await request();
     } catch (err) {
-      lastErr = err;
+      attempt++;
       // A rejection isn't guaranteed to be an object — assigning a property to
       // a primitive (a string, a number) throws in strict mode (ESM always is),
       // which would replace the real rejection with an unrelated TypeError
       // right here in the catch, before any caller sees it.
-      if (err !== null && (typeof err === 'object' || typeof err === 'function')) err.attempts = attempt + 1;
+      if (err !== null && (typeof err === 'object' || typeof err === 'function')) err.attempts = attempt;
       // A board whose watchdog has already fired must not keep retrying: that is
       // the 4-attempts-per-slice storm a timed-out Workday board left running in
       // the background (#5570). The abort is terminal, not a transient failure.
-      if (attempt === retries || !isRetryableError(err) || currentAbortSignal()?.aborted) throw err;
+      if (!isRetryableError(err) || attempt >= maxAttempts || currentAbortSignal()?.aborted) throw err;
+      const isRateLimit = limited !== null && err?.status === 429;
+      const budget = isRateLimit ? limited : base;
+      const used = isRateLimit ? rateLimitRetries++ : transientRetries++;
+      if (used >= budget.retries) throw err;
       // Cap the backoff at maxDelayMs MINUS the jitter, so the jittered total
       // still honours the policy limit. Clamping the sum instead would erase
       // the jitter exactly at the cap — where every retry has converged on the
@@ -848,21 +867,85 @@ async function withRetry(request, ctx, policy = {}) {
       // The jitter itself is clamped to maxDelayMs first: a caller passing a
       // maxDelayMs below JITTER_MS would otherwise drive the backoff negative
       // and hand ctx.sleep a negative delay.
-      const jitterMs = Math.min(JITTER_MS, Math.max(0, maxDelayMs));
-      const ceiling = Math.max(0, maxDelayMs - jitterMs);
-      const backoff = Math.min(baseDelayMs * 2 ** attempt, ceiling);
+      const jitterMs = Math.min(JITTER_MS, Math.max(0, budget.maxDelayMs));
+      const ceiling = Math.max(0, budget.maxDelayMs - jitterMs);
+      const backoff = Math.min(budget.baseDelayMs * 2 ** used, ceiling);
       const retryAfterMs = parseRetryAfterMs(err?.retryAfter);
+      const clamp = isRateLimit ? budget.maxDelayMs * 2 : budget.maxDelayMs * 4;
       const delayMs = retryAfterMs !== null
-        ? Math.min(retryAfterMs, maxDelayMs * 4)
+        ? Math.min(retryAfterMs, clamp)
         : backoff + Math.random() * jitterMs;
+      const retryBudget = policy.retryBudget;
+      if (retryBudget) {
+        if (retryBudget.spentMs + delayMs > retryBudget.maxMs) {
+          if (err !== null && (typeof err === 'object' || typeof err === 'function')) err.retryBudgetExhausted = true;
+          throw err;
+        }
+        retryBudget.spentMs += delayMs;
+      }
       // Interruptible: if the board's watchdog fires during the backoff, stop
       // waiting and give up rather than sleeping out the delay and then issuing
       // a doomed attempt (#5570).
       await abortableSleep(delayMs, ctx, currentAbortSignal());
-      if (currentAbortSignal()?.aborted) throw lastErr;
+      if (currentAbortSignal()?.aborted) throw err;
     }
   }
-  throw lastErr;
+}
+
+/**
+ * Run tasks under a concurrency limit per key and overall.
+ *
+ * `run(key, fn)` starts `fn` once fewer than `perKey` tasks for that key and
+ * fewer than `total` tasks overall are running; otherwise it queues FIFO.
+ * A task holds its slot until it settles, so a request backing off after a
+ * 429 keeps later requests for the same key waiting instead of piling on.
+ *
+ * @param {{ perKey?: number, total?: number }} [limits]
+ * @returns {{ run: <T>(key: string, fn: () => Promise<T>) => Promise<T>, active: (key?: string) => number }}
+ */
+export function createKeyedLimiter({ perKey = 1, total = Infinity } = {}) {
+  const perKeyMax = Math.max(1, Math.floor(perKey) || 1);
+  const totalMax = Number.isFinite(total) ? Math.max(1, Math.floor(total)) : Infinity;
+  const running = new Map();
+  let runningTotal = 0;
+  const queue = [];
+
+  const canStart = (key) => runningTotal < totalMax && (running.get(key) ?? 0) < perKeyMax;
+  const pump = () => {
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      if (!canStart(item.key)) continue;
+      queue.splice(i, 1);
+      i--;
+      start(item);
+    }
+  };
+  const start = ({ key, fn, resolve, reject }) => {
+    running.set(key, (running.get(key) ?? 0) + 1);
+    runningTotal++;
+    Promise.resolve()
+      .then(fn)
+      .then(resolve, reject)
+      .finally(() => {
+        const n = running.get(key) - 1;
+        if (n > 0) running.set(key, n);
+        else running.delete(key);
+        runningTotal--;
+        pump();
+      });
+  };
+  return {
+    run(key, fn) {
+      return new Promise((resolve, reject) => {
+        const item = { key: String(key), fn, resolve, reject };
+        if (queue.length === 0 && canStart(item.key)) start(item);
+        else { queue.push(item); pump(); }
+      });
+    },
+    active(key) {
+      return key === undefined ? runningTotal : (running.get(String(key)) ?? 0);
+    },
+  };
 }
 
 /**

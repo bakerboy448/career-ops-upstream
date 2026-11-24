@@ -464,3 +464,96 @@ if (isRefusedRedirectError(transportFailure) === false) {
     globalThis.fetch = realFetch;
   }
 }
+
+// rateLimit budget: a 429 spends its own retries; a 5xx keeps the base budget.
+{
+  const { createKeyedLimiter } = await import(pathToFileURL(join(ROOT, 'providers/_http.mjs')).href);
+  const policy = { retries: 1, baseDelayMs: 1, maxDelayMs: 10, rateLimit: { retries: 4, baseDelayMs: 100, maxDelayMs: 1000 } };
+  let calls = 0;
+  const sleeps = [];
+  const ctx = {
+    fetchJson: async () => {
+      calls++;
+      if (calls <= 4) { const err = new Error('HTTP 429'); err.status = 429; throw err; }
+      return { ok: true };
+    },
+    sleep: async (ms) => { sleeps.push(ms); },
+  };
+  const out = await fetchJsonWithRetry(ctx, 'https://x.test/', {}, policy);
+  if (out?.ok && calls === 5 && sleeps.length === 4 && sleeps[0] >= 100 && sleeps[3] >= 750) {
+    pass('a 429 uses the rateLimit budget and backoff, beyond the base retries');
+  } else {
+    fail(`rateLimit budget: calls=${calls}, sleeps=${JSON.stringify(sleeps)}`);
+  }
+
+  calls = 0;
+  const ctx5xx = { fetchJson: async () => { calls++; const err = new Error('HTTP 503'); err.status = 503; throw err; }, sleep: async () => {} };
+  try {
+    await fetchJsonWithRetry(ctx5xx, 'https://x.test/', {}, policy);
+    fail('a persistent 503 should rethrow');
+  } catch (e) {
+    if (calls === 2 && e.attempts === 2) pass('a 5xx keeps the base retry budget when rateLimit is set');
+    else fail(`5xx budget with rateLimit: calls=${calls}, attempts=${e.attempts}`);
+  }
+
+  // retryBudget: a shared { spentMs, maxMs } stops retrying once the next sleep would overspend it.
+  {
+    calls = 0;
+    const slept = [];
+    const budget = { spentMs: 0, maxMs: 250 };
+    const ctxBudget = { fetchJson: async () => { calls++; const err = new Error('HTTP 429'); err.status = 429; err.retryAfter = '0.1'; throw err; }, sleep: async (ms) => { slept.push(ms); } };
+    try {
+      await fetchJsonWithRetry(ctxBudget, 'https://x.test/', {}, { ...policy, retryBudget: budget });
+      fail('an exhausted retry budget should rethrow');
+    } catch (e) {
+      if (calls === 3 && slept.length === 2 && e.retryBudgetExhausted === true && budget.spentMs === 200) {
+        pass('retryBudget stops retries once the next sleep would exceed it and flags the error');
+      } else {
+        fail(`retryBudget: calls=${calls}, sleeps=${JSON.stringify(slept)}, spent=${budget.spentMs}, flag=${e.retryBudgetExhausted}`);
+      }
+    }
+  }
+
+  calls = 0;
+  const ctxCap = { fetchJson: async () => { calls++; const err = new Error('HTTP 429'); err.status = 429; throw err; }, sleep: async () => {} };
+  try {
+    await fetchJsonWithRetry(ctxCap, 'https://x.test/', {}, { ...policy, maxAttempts: 2 });
+    fail('maxAttempts should end the ladder');
+  } catch {
+    if (calls === 2) pass('maxAttempts caps every attempt, rate-limited ones included');
+    else fail(`maxAttempts: ${calls} attempts, expected 2`);
+  }
+
+  calls = 0;
+  const sleepsRA = [];
+  const ctxRA = {
+    fetchJson: async () => { calls++; if (calls === 1) { const err = new Error('429'); err.status = 429; err.retryAfter = '7'; throw err; } return {}; },
+    sleep: async (ms) => { sleepsRA.push(ms); },
+  };
+  await fetchJsonWithRetry(ctxRA, 'https://x.test/', {}, policy);
+  // Retry-After 7 s clamps to rateLimit.maxDelayMs * 2 = 2 s here.
+  if (sleepsRA[0] === 2000) pass('a 429 Retry-After is clamped to rateLimit.maxDelayMs * 2');
+  else fail(`Retry-After with rateLimit: slept ${JSON.stringify(sleepsRA)}`);
+
+  // createKeyedLimiter: per-key and total limits, FIFO, slot freed on rejection.
+  const limiter = createKeyedLimiter({ perKey: 1, total: 2 });
+  const log = [];
+  let peakA = 0;
+  let peakAll = 0;
+  const task = (key, id, ms, boom = false) => limiter.run(key, async () => {
+    peakA = Math.max(peakA, limiter.active('a'));
+    peakAll = Math.max(peakAll, limiter.active());
+    log.push(`start ${id}`);
+    await new Promise((r) => setTimeout(r, ms));
+    log.push(`end ${id}`);
+    if (boom) throw new Error('boom');
+    return id;
+  });
+  const results = await Promise.allSettled([task('a', 1, 10, true), task('a', 2, 5), task('b', 3, 5), task('c', 4, 5)]);
+  if (peakA === 1 && peakAll === 2 && results[0].status === 'rejected' && results[1].value === 2
+    && log.indexOf('start 2') > log.indexOf('end 1')) {
+    pass('createKeyedLimiter enforces per-key and total limits and frees a slot on rejection');
+  } else {
+    fail(`createKeyedLimiter: peakA=${peakA} peakAll=${peakAll} log=${log.join(',')}`);
+  }
+}
