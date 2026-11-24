@@ -1,4 +1,8 @@
-import { readApplications, readInbox, requestReportReader, doctorState, withCloseDates } from "@/lib/career-ops";
+import { readApplications, readInbox, readScanDates, requestReportReader, doctorState, withCloseDates } from "@/lib/career-ops";
+import { pendingInbox } from "@/lib/inbox-pending.mjs";
+import { tallyDays } from "@/lib/home/now-summary.mjs";
+import { flaggedPosting } from "@/lib/report-sections.mjs";
+import { companyPresentation } from "@/lib/company-presentation.mjs";
 import { pickAwaitingDecision, pickApplyNext, includeApplyTarget, localDay } from "@/lib/home/awaiting.mjs";
 import { cardReason } from "@/lib/machine-summary.mjs";
 import type { CardReason } from "@/lib/machine-summary.mjs";
@@ -64,8 +68,12 @@ export default async function Home() {
     if (entry.legitimacy) legitimacy[app.n] = entry.legitimacy;
     postingUrls[app.n] = applyPostingUrl(entry.reportUrl, app.url, app.applyLink);
   }
+  // Every scored row whose report says Apply, not only the six cards: the
+  // summary counts how many are ready to send and how many still need a CV.
+  const applyCalls = applications.filter((app) => readApp(app).reason?.decision === "Apply" && !flaggedPosting(readApp(app).legitimacy));
+  const cvRows = [...awaiting, ...applyCalls.filter((app) => !awaiting.includes(app))];
   const disks = await readCvDiskForRows(
-    awaiting.map((app) => ({
+    cvRows.map((app) => ({
       n: app.n,
       company: app.company,
       trackerMarked: (app.pdf ?? "").includes("✅"),
@@ -78,13 +86,31 @@ export default async function Home() {
   for (const app of awaiting) {
     applyFacts[app.n] = { pdfOnDisk: disks[app.n]?.applyPdfReady ?? false, postingUrl: postingUrls[app.n] ?? "" };
   }
+  const readyRows = applyCalls.filter((app) => disks[app.n]?.applyPdfReady);
+  const topReady = readyRows[0] ?? null;
+  const best = applications[0] ?? null;
+  const pending = pendingInbox(snapshot.inbox);
+  const now = Date.now();
+  // 60 days of day counts is enough for any "since your last visit" the page shows.
+  const floorDay = new Date(now - 60 * 86_400_000).toISOString().slice(0, 10);
+  const scanDates = readScanDates();
+  const nowFacts = {
+    applyReady: readyRows.length,
+    applyNeedsCv: applyCalls.length - readyRows.length,
+    topReady: topReady ? { n: topReady.n, company: companyPresentation(topReady).label, score: topReady.score } : null,
+    awaiting: applications.length,
+    best: best && Number.isFinite(scoreNum(best.score)) ? { company: companyPresentation(best).label, score: best.score } : null,
+    foundByDay: tallyDays(pending.map((job) => scanDates.get(job.url) ?? job.postedAt), floorDay),
+    weekAgoDay: new Date(now - 7 * 86_400_000).toISOString().slice(0, 10),
+    scoredByDay: tallyDays(snapshot.applications.filter((app) => Number.isFinite(scoreNum(app.score))).map((app) => app.date), floorDay),
+  };
   // Established / in-between: the dual-loop retention dashboard. Show the setup
   // banner whenever ANY prereq is missing (mirrors the core doctor.mjs), so a
   // portals-missing user is nudged rather than told "all caught up".
   // Once there is a tracker or an inbox, that work leads. Setup stays on the
   // page, under the queue, until the profile panel is complete.
   const dashboard = (
-    <TodayDashboard applications={applications} reasons={reasons} legitimacy={legitimacy} inbox={inbox} inBetween={phase === "in-between"} applyFacts={applyFacts} applyDay={applyDay} />
+    <TodayDashboard applications={applications} reasons={reasons} legitimacy={legitimacy} inbox={inbox} inBetween={phase === "in-between"} applyFacts={applyFacts} applyDay={applyDay} nowFacts={nowFacts} />
   );
   const lead = homeLead(snapshot.applications.length > 0 || snapshot.inbox.length > 0);
   return (

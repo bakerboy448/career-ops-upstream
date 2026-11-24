@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Bell, CircleHelp, Sparkles, ArrowRight, Undo2, X } from "lucide-react";
+import { Bell, ChevronRight, CircleHelp, Sparkles, ArrowRight, Undo2, X } from "lucide-react";
 import { instrumentSerif } from "@/lib/fonts";
 import type { Application, InboxJob } from "@/lib/career-ops";
 import type { DiscoveredOffer } from "@/lib/explore";
@@ -17,12 +17,26 @@ import { FollowupsDueSectionSkeleton } from "@/components/page-loading-skeletons
 import { scoreNum } from "@/lib/format";
 import { undoStatus } from "@/lib/pipeline-status.mjs";
 import { pickAwaitingDecision, groupAwaiting, pickApplyNext, includeApplyTarget } from "@/lib/home/awaiting.mjs";
-import { orderTodayQueue } from "@/lib/home/today-queue.mjs";
 import { selectDueFollowups } from "@/lib/core/followup-view.mjs";
 import { companyPresentation } from "@/lib/company-presentation.mjs";
 import { ApplyNext } from "@/components/apply-next";
-import { resolveHeroState, mayClaimAllClear, showsQueue, missingSourceLabel, displayCounts } from "@/lib/home/hero-state.mjs";
+import { resolveHeroState, mayClaimAllClear, missingSourceLabel, displayCounts } from "@/lib/home/hero-state.mjs";
 import { homeFollowupRemainder } from "@/lib/home/followups-shown.mjs";
+import { LAST_VISIT_STORAGE_KEY, countSince, localDay, nowItems, resolveLastVisit } from "@/lib/home/now-summary.mjs";
+
+export type NowFacts = {
+  applyReady: number;
+  applyNeedsCv: number;
+  topReady: { n: string; company: string; score: string } | null;
+  awaiting: number;
+  best: { company: string; score: string } | null;
+  foundByDay: Record<string, number>;
+  scoredByDay: Record<string, number>;
+  /** YYYY-MM-DD seven days before the request, the window used before a last visit is known. */
+  weekAgoDay: string;
+};
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 // The retention "Today": a dual-loop action queue (the maintainer's
 // "N new matches this week · M follow-ups due"). SUPPLY loop = fresh free-scan
@@ -36,6 +50,7 @@ export function TodayDashboard({
   inbox,
   applyFacts = {},
   applyDay,
+  nowFacts,
 }: {
   applications: Application[];
   reasons: Record<string, CardReason>;
@@ -46,6 +61,8 @@ export function TodayDashboard({
   applyFacts?: Record<string, { pdfOnDisk: boolean; postingUrl: string }>;
   /** Server calendar day. Apply next does not read the browser clock. */
   applyDay: string;
+  /** Server-read counts behind the "look at this now" list. */
+  nowFacts?: NowFacts;
 }) {
   const [followups, setFollowups] = useState<FollowUp[]>([]);
   const [overdue, setOverdue] = useState(0);
@@ -61,6 +78,18 @@ export function TodayDashboard({
   const requestGeneration = useRef(0);
   const router = useRouter();
   const dateLabel = useMemo(() => new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" }), []);
+  // "New since your last visit". Read after mount: the server has no storage,
+  // so the first paint uses the 7-day window and the baseline replaces it.
+  const [sinceDay, setSinceDay] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      const visit = resolveLastVisit(window.localStorage.getItem(LAST_VISIT_STORAGE_KEY), Date.now());
+      if (visit.baseline) setSinceDay(localDay(visit.baseline));
+      window.localStorage.setItem(LAST_VISIT_STORAGE_KEY, visit.store);
+    } catch {
+      // Blocked storage: the 7-day window stays.
+    }
+  }, []);
 
   const refetch = useCallback(() => {
     const generation = ++requestGeneration.current;
@@ -186,63 +215,129 @@ export function TodayDashboard({
     () => selectDueFollowups(followups, Math.max(followups.length, 1)),
     [followups],
   );
-  const queueLead = orderTodayQueue([
-    { kind: "follow-up", due: true, count: shown.overdue },
-    { kind: "match", due: false, count: shown.newThisWeek },
-  ]).filter((item) => item.count > 0);
+
+  // The 7-day floor comes from the server so both renders count the same days.
+  const newSince = sinceDay ?? nowFacts?.weekAgoDay ?? "";
+  const newFound = countSince(nowFacts?.foundByDay, newSince);
+  const newScored = countSince(nowFacts?.scoredByDay, newSince);
+  const sinceLabel = sinceDay
+    ? `since ${new Date(`${sinceDay}T12:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric" })}, your last visit`
+    : "in the last 7 days";
+  const lookNow = nowItems({
+    followupsDue: shown.overdue,
+    applyReady: nowFacts?.applyReady ?? 0,
+    awaiting: nowFacts?.awaiting ?? awaiting.length,
+    newFound,
+    newScored,
+  });
+  const lead = lookNow[0] ?? null;
+  const nowRow = (item: (typeof lookNow)[number]) => {
+    switch (item.kind) {
+      case "followups":
+        return { label: "Follow-ups due", detail: "Nudge these applications", href: "/followups" };
+      case "apply-ready":
+        return {
+          label: "Ready to apply",
+          detail: nowFacts?.topReady ? `Start with ${nowFacts.topReady.company}, ${nowFacts.topReady.score}` : "Report says Apply and the tailored CV is on disk",
+          href: nowFacts?.topReady ? `/pipeline/${nowFacts.topReady.n}` : "#decide",
+        };
+      case "decide":
+        return {
+          label: "Scored, waiting for your decision",
+          detail: [
+            nowFacts?.best ? `Best: ${nowFacts.best.company}, ${nowFacts.best.score}` : "Review, skip, or mark applied",
+            nowFacts && nowFacts.applyNeedsCv > 0 ? `${nowFacts.applyNeedsCv} marked Apply still ${nowFacts.applyNeedsCv === 1 ? "needs" : "need"} a tailored CV` : "",
+          ].filter(Boolean).join(" · "),
+          href: "/pipeline?tab=EVALUATED&sort=score",
+        };
+      default:
+        return {
+          label: `New ${sinceLabel}`,
+          detail: [newFound > 0 ? `${newFound} found, not scored yet` : "", newScored > 0 ? `${newScored} scored` : ""].filter(Boolean).join(" · "),
+          href: "/pipeline",
+        };
+    }
+  };
+  const leadHeadline = lead
+    ? lead.kind === "followups"
+      ? `${plural(lead.count, "follow-up is", "follow-ups are")} due`
+      : lead.kind === "apply-ready"
+        ? `${plural(lead.count, "role is", "roles are")} ready to apply`
+        : lead.kind === "decide"
+          ? `${plural(lead.count, "scored role needs", "scored roles need")} your decision`
+          : `${plural(lead.count, "new role", "new roles")} ${sinceDay ? "since your last visit" : "this week"}`
+    : null;
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-10 max-sm:pb-24">
-      <section className="dot-bg relative overflow-hidden rounded-2xl border border-border bg-surface/40 px-7 py-10 md:px-10 md:py-12">
+      <section className="dot-bg relative overflow-hidden rounded-2xl border border-border bg-surface/40 px-7 py-9 max-sm:px-4 max-sm:py-6 md:px-10 md:py-10">
         <div>
-          <p className="font-mono text-xs uppercase tracking-[0.2em] text-muted">
-            <span className="text-faint">//</span> today · <span className="tabular-nums">{dateLabel}</span>
-          </p>
-          <h1 className={`${instrumentSerif.className} mt-3 text-4xl leading-[1.05] text-landing md:text-5xl`}>
-            {heroState === "loading" ? (
+          <h1 className={`${instrumentSerif.className} text-balance text-4xl leading-[1.05] text-landing max-sm:text-[2rem] md:text-5xl`}>
+            {leadHeadline ? (
+              leadHeadline
+            ) : heroState === "loading" ? (
               <>Your career queue is loading.</>
             ) : heroState === "unavailable" ? (
               <>Some updates are unavailable.</>
             ) : allClear ? (
               <>You&apos;re all caught up.</>
-            ) : showsQueue(heroState) ? (
-              <>
-                {queueLead.map((item, index) => (
-                  <span key={item.kind}>
-                    {index > 0 && <span className="text-faint"> · </span>}
-                    {item.kind === "follow-up" ? (
-                      <>
-                        <span className="text-brand-text tabular-nums">{item.count}</span> follow-up{item.count === 1 ? "" : "s"} due
-                      </>
-                    ) : (
-                      <>
-                        <span className="text-brand-text tabular-nums">{item.count}</span> new match{item.count === 1 ? "" : "es"} this week
-                      </>
-                    )}
-                  </span>
-                ))}
-                {/* queue-partial with work known only from the server snapshot:
-                    both loops are down but the pipeline still has decisions
-                    waiting, so the queue is real while neither count is. */}
-                {queueLead.length === 0 && <>Your queue is waiting.</>}
-              </>
             ) : (
               <>Your queue is waiting.</>
             )}
           </h1>
-          <p className="mt-4 max-w-xl text-sm text-muted">
+          <p className="mt-3 max-w-xl text-sm text-muted">
+            <span className="tabular-nums">{dateLabel}</span>
+            {" · "}
             {heroState === "unavailable"
               ? "We couldn't load all of today's updates. Try again."
               : heroState === "queue-partial"
                 ? `${missingSources} could not be read, so this may be missing work. What loaded is below.`
-                : allClear
-                  ? "I'll keep scanning the market in the background and surface anything that fits."
-                  : followupsEnabled
-                    ? "Your action queue for today — discovery and follow-ups, in one place."
-                    : "Your action queue for today, in one place."}
+                : lead
+                  ? "Work down this list. The first row is the next thing to do."
+                  : allClear
+                    ? "Nothing needs you. The scan state is below, so you can see it ran."
+                    : followupsEnabled
+                      ? "Your action queue for today — discovery and follow-ups, in one place."
+                      : "Your action queue for today, in one place."}
           </p>
-          <div className="mt-6 flex flex-wrap gap-2.5">
-            <Link href="/explore" className="inline-flex items-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-brand-foreground transition hover:bg-brand-200 max-sm:min-h-[44px]">
+
+          {lookNow.length > 0 && (
+            <ol aria-label="Look at this now" className="mt-5 max-w-2xl divide-y divide-border overflow-hidden rounded-xl border border-border bg-surface">
+              {lookNow.map((item, index) => {
+                const row = nowRow(item);
+                return (
+                  <li key={item.kind}>
+                    <Link
+                      href={row.href}
+                      className={
+                        "group flex min-h-[56px] items-center gap-3 px-4 py-2.5 transition-colors hover:bg-surface-hover " +
+                        (index === 0 ? "bg-brand-soft/60" : "")
+                      }
+                    >
+                      <span className={"w-10 shrink-0 text-right text-xl font-semibold tabular-nums " + (index === 0 ? "text-brand-text" : "text-foreground")}>
+                        {item.count}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium text-foreground">{row.label}</span>
+                        {row.detail && <span className="block text-[13px] sm:truncate text-muted">{row.detail}</span>}
+                      </span>
+                      {index === 0 && <span className="shrink-0 rounded-full bg-brand px-2.5 py-1 text-xs font-medium text-brand-foreground max-sm:hidden">Start here</span>}
+                      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-brand-text" />
+                    </Link>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+
+          <div className="mt-5 flex flex-wrap gap-2.5">
+            <Link
+              href="/explore"
+              className={
+                "inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium transition max-sm:min-h-[44px] " +
+                (lead ? "border border-border text-foreground hover:border-brand/40 hover:text-brand-text" : "bg-brand text-brand-foreground hover:bg-brand-200")
+              }
+            >
               Find new roles <ArrowRight className="size-4" />
             </Link>
             <Link href="/pipeline" className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2.5 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand-text max-sm:min-h-[44px]">
@@ -304,7 +399,7 @@ export function TodayDashboard({
 
       {/* B. Awaiting your decision */}
       {awaiting.length > 0 && (
-        <Section icon={CircleHelp} title="Awaiting your decision" hint="Best score first">
+        <Section id="decide" icon={CircleHelp} title="Awaiting your decision" hint="Best score first">
           {applyTarget && (
             <ApplyNext
               n={applyTarget.n}
@@ -384,9 +479,9 @@ export function TodayDashboard({
   );
 }
 
-function Section({ icon: Icon, title, hint, children }: { icon: React.ComponentType<{ className?: string }>; title: string; hint: string; children: React.ReactNode }) {
+function Section({ id, icon: Icon, title, hint, children }: { id?: string; icon: React.ComponentType<{ className?: string }>; title: string; hint: string; children: React.ReactNode }) {
   return (
-    <section className="mt-10">
+    <section id={id} className="mt-10 scroll-mt-20">
       <div className="mb-3 flex items-center gap-2">
         <Icon className="size-4 text-brand-text" />
         <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-muted">{title}</h2>
